@@ -232,7 +232,7 @@ library CREATE3 {
                     // 即0x94 = 0x80（string 前缀）+ 0x14（address长度20）
                     // 完整的RLP结构图：
                     // d6          ← list 前缀：后续共 22 字节
-                    // ├── 94← string 前缀：后续 20 字节是 address
+                    // ├── 94      ← string 前缀：后续 20 字节是 address
                     // │   └── <proxy address>  ← 20 字节
                     // └── 01      ← nonce = 1（单字节直接编码）
                     hex"d6_94",
