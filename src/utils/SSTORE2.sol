@@ -71,7 +71,7 @@ library SSTORE2 {
             //   → 11 = initcode 自身的长度（0x0B），runtimeCode 从偏移 11 开始
             // 0x59    |  0x59               | MSIZE        | 0 codeOffset(11)
             //   → MSIZE：返回当前内存最高使用地址，此时内存未使用，返回 0
-            //   → 与 CREATE3 使用 RETURNDATASIZE 压0 类似的gas 优化技巧
+            //   → 目的：获取空闲内存的起始位置，作为后续 CODECOPY 的 destOffset
             // 0x81    |  0x81               | DUP2         | codeOffset(11) 0 codeOffset(11)
             //   → DUP2：复制栈上从顶部往下数第 2 个元素，压到栈顶。全部助记符为DUP1～DUP16
             // 0x38    |  0x38               | CODESIZE     | codeSize codeOffset(11) 0 codeOffset(11)
@@ -82,6 +82,7 @@ library SSTORE2 {
             // 0x92    |  0x92               | SWAP3        | codeOffset(11) (codeSize - codeOffset(11)) 0 (codeSize - codeOffset(11))
             //   → 重新排列栈顶（SWAP3：把栈顶和从顶部往下数第 4 个元素互换位置），为CODECOPY 准备参数：destOffset=0, offset=codeOffset, size
             // 0x59    |  0x59               | MSIZE        | 0 codeOffset(11) (codeSize - codeOffset(11)) 0 (codeSize - codeOffset(11))
+            //   → 再次获取空闲内存起始位置，作为 CODECOPY 的 destOffset 参数
             // 0x39    |  0x39               | CODECOPY     | 0 (codeSize - codeOffset(11))
             //   → CODECOPY(destOffset=0, offset=11, size=runtimeCodeLength)
             //   → 将 runtimeCode 从 code 区拷贝到内存 0x00 开始的位置
