@@ -5,136 +5,300 @@ pragma solidity >=0.8.0;
 /// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SignedWadMath.sol)
 /// @author Modified from Remco Bloemen (https://xn--2-umb.com/22/exp-ln/index.html)
 
-/// @dev Will not revert on overflow, only use where overflow is not possible.
+/** 功能总结：
+ * 有符号 18 位小数定点数（wad）数学库，所有函数均为 free function（不属于任何合约/library）
+ * 整个库统一使用 int256 作为输入输出类型（包括 toWadUnsafe 等转换函数），
+ * 使所有函数可以直接串联调用，无需在调用链中反复进行 int256/uint256 转型
+ *
+ * "wad" 是 DeFi 中的标准定点数表示法（源自 MakerDAO 的 ds-math 库）：1 wad = 1e18
+ * 例如：实数 1.5 →存储为 1500000000000000000（1.5 × 1e18）
+ *
+ * 核心函数：
+ * - toWadUnsafe / toDaysWadUnsafe / fromDaysWadUnsafe：单位转换（整数 ↔ wad，秒 ↔ wad天）
+ * - unsafeWadMul / unsafeWadDiv：不检查溢出的定点乘除法
+ * - wadMul / wadDiv：带溢出检查的定点乘除法
+ * - wadPow / wadExp / wadLn：定点幂运算、指数函数、自然对数
+ * - unsafeDiv：不检查除零的整数除法
+ *
+ * "unsafe" 前后缀表示不做溢出/除零检查，由调用方确保输入安全
+ *
+ * wadExp 和 wadLn 使用 Remco Bloemen 的算法：
+ * - 将 10^18 定点数转为 2^96 二进制定点数（利用 EVM 原生移位操作）
+ * - 范围缩减后用Padé 有理逼近（比 Taylor 级数更高效、更精确）
+ * - 全程unchecked + assembly，极致gas优化
+ */
+
+/*
+ * @dev 将无符号整数转为 wad（乘以 1e18）
+ * 不做溢出检查，调用方需确保 x × 1e18 不溢出int256
+ * @param x 无符号整数
+ * @return r wad 格式的结果（int256）
+ */
 function toWadUnsafe(uint256 x) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Multiply x by 1e18.
+        // x × 1e18，直接 mul 不做溢出检查
         r := mul(x, 1000000000000000000)
     }
 }
 
-/// @dev Takes an integer amount of seconds and converts it to a wad amount of days.
-/// @dev Will not revert on overflow, only use where overflow is not possible.
-/// @dev Not meant for negative second amounts, it assumes x is positive.
+/*
+ * @dev 将秒数转为wad 格式的天数。是进入 wad 数学世界的入口，把链上时间差转为高精度天数喂给 wadExp 等函数
+ *      公式：r = x × 1e18 / 86400（1天= 86400秒）
+ *      不做溢出检查，不处理负数（假设 x 为正）
+ *      使用场景：凡是要把时间差喂给 wadExp / wadMul / wadDiv 做连续数学运算的场景，
+ *          都需要先用 toDaysWadUnsafe 转成 wad 天数，否则整数除法会把不足一天的部分截断为 0
+ *          举例：1.线性释放（vesting）2.代币排放曲线 3.连续利率计算（DeFi 借贷中按时间连续复利）
+ * @param x 秒数（无符号整数）
+ * @return r wad 格式的天数（int256）
+ */
 function toDaysWadUnsafe(uint256 x) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Multiply x by 1e18 and then divide it by 86400.
+        // x × 1e18 / 86400
         r := div(mul(x, 1000000000000000000), 86400)
     }
 }
 
-/// @dev Takes a wad amount of days and converts it to an integer amount of seconds.
-/// @dev Will not revert on overflow, only use where overflow is not possible.
-/// @dev Not meant for negative day amounts, it assumes x is positive.
+/*
+ * @dev 将 wad 格式的天数转为秒数。是wad 数学世界的出口，把计算结果转回链上可用的秒数
+ *      公式：r = x × 86400 / 1e18
+ *      不做溢出检查，不处理负数（假设 x 为正）
+ *      典型调用链：
+ *          秒数──toDaysWadUnsafe──→ wad天数 ──wadExp/wadMul等运算──→ wad结果 ──fromDaysWadUnsafe──→ 秒数
+ * @param x wad 格式的天数（int256）
+ * @return r 秒数（uint256）
+ */
 function fromDaysWadUnsafe(int256 x) pure returns (uint256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Multiply x by 86400 and then divide it by 1e18.
+        // x × 86400 / 1e18
         r := div(mul(x, 86400), 1000000000000000000)
     }
 }
 
-/// @dev Will not revert on overflow, only use where overflow is not possible.
+/*
+ * @dev wad 定点乘法（不检查溢出）
+ *      数学原理：a_wad × b_wad = (a × 1e18) × (b × 1e18) = a × b × 1e36
+ *      需要除以 1e18 才能得到正确的wad 结果：a × b × 1e18
+ *      使用 sdiv（有符号除法）处理负数
+ * @param x 第一个 wad 操作数
+ * @param y 第二个 wad 操作数
+ * @return r wad 格式的乘积
+ */
 function unsafeWadMul(int256 x, int256 y) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Multiply x by y and divide by 1e18.
+        // (x × y) / 1e18
+        // 注：sdiv是 EVM 的有符号整数除法操作码（Signed DIVision），对应无符号版本是 div
         r := sdiv(mul(x, y), 1000000000000000000)
     }
 }
 
-/// @dev Will return 0 instead of reverting if y is zero and will
-/// not revert on overflow, only use where overflow is not possible.
+/*
+ * @dev wad 定点除法（不检查溢出和除零）
+ *      数学原理：(a_wad / b_wad) = (a × 1e18) / (b × 1e18) = a / b
+ *      需要先乘 1e18 才能得到正确的 wad 结果：(a / b) × 1e18
+ *      y 为 0 时返回 0（sdiv 除零行为），不会revert
+ * @param x 被除数（wad 格式）
+ * @param y 除数（wad 格式）
+ * @return r wad 格式的商
+ */
 function unsafeWadDiv(int256 x, int256 y) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Multiply x by 1e18 and divide it by y.
+        // (x × 1e18) / y
         r := sdiv(mul(x, 1000000000000000000), y)
     }
 }
 
+/*
+ * @dev wad 定点乘法（带溢出检查）
+ *      公式：r = (x × y) / 1e18
+ *      溢出检查包含两个条件：
+ *        条件 A：x == 0 || (x * y) / x == y → 标准乘法溢出检查
+ *        条件 B：x < -1 || y > type(int256).min → 边缘情况检查
+ * @param x 第一个 wad 操作数
+ * @param y 第二个 wad 操作数
+ * @return r wad 格式的乘积，溢出时revert
+ */
 function wadMul(int256 x, int256 y) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Store x * y in r for now.
+        //先计算 x * y 存入 r
         r := mul(x, y)
 
-        // Combined overflow check (`x == 0 || (x * y) / x == y`) and edge case check
-        // where x == -1 and y == type(int256).min, for y == -1 and x == min int256,
-        // the second overflow check will catch this.
-        // See: https://secure-contracts.com/learn_evm/arithmetic-checks.html#arithmetic-checks-for-int256-multiplication
-        // Combining into 1 expression saves gas as resulting bytecode will only have 1 `JUMPI`
-        // rather than 2.
+        // 组合溢出检查（合并为1 个表达式，只产生 1 个 JUMPI）：
         if iszero(
             and(
+                //   条件 A: or(iszero(x), eq(sdiv(r, x), y))
+                //     → x == 0（0 乘任何数不溢出）或 (x*y)/x == y（验证乘法可逆）
                 or(iszero(x), eq(sdiv(r, x), y)),
+                //   条件 B: or(lt(x, not(0)), sgt(y, 0x80...0))
+                //     → x < -1 或 y > type(int256).min
+                //     → 排除 x=-1, y=type(int256).min的二补码陷阱
+                //     其中， not(0)是-1的补码，0x80...0是type(int256).min的补码
+                //     注：
+                //        1.条件 B 针对二补码陷阱：x = -1, y = type(int256).min时
+                //          (-1) × (-2^255) 在二补码中回绕为 -2^255：(-1) × (-2^255) = 2^255 > int256.max（即2^255 - 1），产生溢出，
+                //          溢出后 EVM 的 mul 直接截断到 256 位，即1000...000（1后面 255 个 0）。这个位模式恰好就是 type(int256).min = -2^255
+                //          然后， (-2^255)/(-1) = -2^255 = y。（原因同上，2^255 由于溢出而被截断成为-2^255）
+                //          导致条件 A 误判为"未溢出"，需要条件 B 额外捕获
+                //        2.为什么不写 x != -1 或 y! = type(int256).min ?
+                //          Yul 没有 neq 操作码，用 lt/sgt 替代 iszero(eq(...))，省 2 个操作码
+                //          且 lt/sgt 比 != 范围更宽，但只会放过更多安全情况，不会漏掉目标
                 or(lt(x, not(0)), sgt(y, 0x8000000000000000000000000000000000000000000000000000000000000000))
             )
         ) {
+            // 如果产生溢出，不带有任何信息直接revert
             revert(0, 0)
         }
 
-        // Scale the result down by 1e18.
+        // 溢出检查通过，除以 1e18 得到 wad 结果
         r := sdiv(r, 1000000000000000000)
     }
 }
 
+/*
+ * @dev wad 定点除法（带溢出检查）
+ *      公式：r = (x × 1e18) / y
+ *      溢出检查：y != 0 且 (x * 1e18) / 1e18 == x
+ *        → 确保除数不为零，且 x * 1e18 没有溢出
+ * @param x 被除数（wad 格式）
+ * @param y 除数（wad 格式）
+ * @return r wad 格式的商，溢出或除零时 revert
+ */
 function wadDiv(int256 x, int256 y) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Store x * 1e18 in r for now.
+        // 先计算 x * 1e18 存入 r
         r := mul(x, 1000000000000000000)
 
-        // Equivalent to require(y != 0 && ((x * 1e18) / 1e18 == x))
+        // 检查：y != 0 且 r / 1e18 == x（确保 x * 1e18 没有溢出）
+        // 注：iszero(iszero(y)) 是 Yul 中判断 y != 0 的标准写法
         if iszero(and(iszero(iszero(y)), eq(sdiv(r, 1000000000000000000), x))) {
+            // 如果产生溢出，不带有任何信息直接revert
             revert(0, 0)
         }
 
-        // Divide r by y.
+        // r 除以 y 得到最终结果
         r := sdiv(r, y)
     }
 }
 
-/// @dev Will not work with negative bases, only use when x is positive.
+/*
+ * @dev wad 定点幂运算
+ *      数学原理：x^y = (e^ln(x))^y = e^(ln(x) × y)
+ *      在 wad 格式下：wadPow(x, y) = wadExp(wadLn(x) * y / 1e18)
+ *      注：只支持正数底数（ln(x) 要求 x > 0）
+ * @param x 底数（wad 格式，必须为正）
+ * @param y 指数（wad 格式）
+ * @return wad 格式的 x^y
+ */
 function wadPow(int256 x, int256 y) pure returns (int256) {
-    // Equivalent to x to the power of y because x ** y = (e ** ln(x)) ** y = e ** (ln(x) * y)
-    return wadExp((wadLn(x) * y) / 1e18); // Using ln(x) means x must be greater than 0.
+    // x^y 等价于 e^(ln(x) * y)
+    // 其中，wadLn() 要求 x > 0
+    return wadExp((wadLn(x) * y) / 1e18);
 }
 
+/*
+ * @dev wad 定点自然指数函数 e^x
+ *      算法来自 Remco Bloemen（https://xn--2-umb.com/22/exp-ln/）
+ *      流程：
+ *        1. 边界检查（结果太小返回 0，太大则revert）
+ *        2. 基数转换：10^18 定点 → 2^96 二进制定点（利用 EVM 原生移位）
+ *        3. 范围缩减：exp(x) = exp(x') × 2^k，将 x' 缩减到 (-½ln2, ½ln2)
+ *        4. (6,7) 阶 Padé 有理逼近：比 Taylor 级数更高效、更精确
+ *        5. 最终组装：乘以缩放因子 s、2^k、基数转换因子，一步完成
+ * @param x wad 格式的指数（代表实数 x/1e18）
+ * @return r wad 格式的 e^(x/1e18)
+ */
 function wadExp(int256 x) pure returns (int256 r) {
     unchecked {
-        // When the result is < 0.5 we return zero. This happens when
-        // x <= floor(log(0.5e18) * 1e18) ~ -42e18
+        // 1. 边界检查
+        // 1.1 下界检查
+        //  wad 是整数，所以最小正值就是 1（代表实数 1/1e18 = 10^-18）
+        //  如果计算结果的实数值< 0.5 × 10^-18，四舍五入后就是 0，直接返回 0即可
+        //  通过解不等式 exp(x/1e18) < 0.5 × 10^-18 -> x < ln(0.5 × 10^-18) × 1e18，得：
+        //  -42139678854452767551 = ⌊ln(0.5e-18) × 1e18⌋，即x的下界
         if (x <= -42139678854452767551) return 0;
 
-        // When the result is > (2**255 - 1) / 1e18 we can not represent it as an
-        // int. This happens when x >= floor(log((2**255 - 1) / 1e18) * 1e18) ~ 135.
+        // 1.2 上界检查
+        //  wad 能表示的最大值是 type(int256).max = 2^255-1（代表实数 (2^255-1)/1e18）
+        //  如果 e^(x/1e18) 的结果乘以 1e18 超过了 2^255-1，int256 就装不下了
+        //  通过解不等式e^(x/1e18) × 1e18 > 2^255-1 -> x > ln((2^255-1)/1e18) × 1e18，得：
+        //  135305999368893231589 = ⌊ln((2^255-1)/1e18) × 1e18⌋，即x的上界
         if (x >= 135305999368893231589) revert("EXP_OVERFLOW");
+        // x 的有效范围是 (-42.14, 135.31) × 1e18
 
-        // x is now in the range (-42, 136) * 1e18. Convert to (-42, 136) * 2**96
-        // for more intermediate precision and a binary basis. This base conversion
-        // is a multiplication by 1e18 / 2**96 = 5**18 / 2**78.
-        x = (x << 78) / 5**18;
+        // 2. 基数转换：从 10^18 定点转为 2^96 定点
+        //  由于x是10^18 定点数（每次乘除都涉及 / 1e18，EVM 做除法很贵）。转成 2 的幂次后，除法变成移位（>> 96），便宜很多
+        // 2.1 转换因子的计算：
+        //  10^18 定点：实数 1.0 存储为 1e18，2^96 定点：实数 1.0 存储为 2^96
+        //  要把 x 从 10^18 定点转成 2^96 定点：x_new = x × (2^96 / 10^18)
+        //  转换因子 = 2^96 / 10^18 = 2^96 / (2×5)^18 = 2^96 / 2^18 / 5^18 = 2^78 / 5^18
+        //  所以 x_new = x × 2^78 / 5^18 = (x << 78) / 5^18
+        // 2.2 为什么选 2^96 定点数：
+        //   1. 2^96 ≈ 7.9 × 10^28 → 约 29 位十进制精度，远超 wad 的 18 位需求
+        //   2. 后面Padé逼近中有大量 (p * x) >> 96 操作。两个 2^96 数相乘得2^192，不超过 256 位
+        //   3. 用>> 96 替代 / 1e18。移位比除法便宜。且Padé逼近有十几次乘除，每次都省一点，累计可观
+        x = (x << 78) / 5 ** 18;
 
-        // Reduce range of x to (-½ ln 2, ½ ln 2) * 2**96 by factoring out powers
-        // of two such that exp(x) = exp(x') * 2**k, where k is an integer.
-        // Solving this gives k = round(x / log(2)) and x' = x - k * log(2).
-        int256 k = ((x << 96) / 54916777467707473351141471128 + 2**95) >> 96;
+        // 3. 范围缩减：exp(x) = exp(x') × 2^k
+        // 3.1 为什么要范围缩减？
+        //  Padé逼近只在很小的范围内精确。exp(100) 很大，直接逼近误差爆炸。但利用数学恒等式：
+        //  exp(x) = exp(x - k × ln2 + k × ln2) = exp(x - k × ln2) × exp(k × ln2) = exp(x - k × ln2) × exp(ln2)^k = exp(x') × 2^k
+        //  其中 x' = x - k × ln2，选合适的 k 让 x' 很小，最后乘以 2^k（移位操作，低gas）还原结果
+        // 3.2 如何确定 k？
+        //  前提：要确定一个k，然后让x' = x - k × ln2很小，这样就可以保证Padé逼近的精度越高
+        //  首先计算看下x中含有多少个ln2，将这个数定为k就可以保证x'足够小，即计算k = round(x / ln2)
+        //  令 x / ln2 的真实值 = k + ε，其中 ε 是误差。由于round是四舍五入，所以 |ε| < 0.5
+        //  得到：x' = x - k × ln2 = (k + ε) × ln2 - k × ln2 = ε × ln2
+        //  因为|ε| < 0.5 ，所以|x'| = |ε × ln2| < 0.5 × ln2 = ½ln2
+        //  即 x' 落在 (-½ln2, ½ln2) 范围内
+        //  注：如果计算k的公式换成k = floor(x / ln2)，那么误差 ε ∈ [0, 1)
+        //  这样得到的 x' 的范围是 [0, ln2)。由于Padé逼近在原点附近最精确，误差向两边递增，所以此时逼近精度更差
+        // 3.3 计算k的工程实现
+        //  k = round(x / ln2) 工程上实现为 k = floor(x / ln2 + 0.5)
+        //  为了保留x / ln2的小数部分，所以将整体扩大2^96倍，做完加法后再缩小2^96倍实现floor的功能
+        //  几个常数含义：
+        //  - 54916777467707473351141471128 = ln(2) × 2^96
+        //  - 2 ** 95 = 0.5 × 2^96
+        //  这样，下面式子就是在计算 k = ((x_96/ LN2_96) + 0.5_96) >> 96
+        //  注：通过x的范围可以计算出k的范围：[-61, 195]
+        int256 k = ((x << 96) / 54916777467707473351141471128 + 2 ** 95) >> 96;
+        // 计算x'
         x = x - k * 54916777467707473351141471128;
 
-        // k is in the range [-61, 195].
-
-        // Evaluate using a (6, 7)-term rational approximation.
-        // p is made monic, we'll multiply by a scale factor later.
+        // 4. (6,7) 阶 Padé 有理逼近
+        // 4.1 什么是 Padé 逼近？
+        //  Taylor 级数用多项式逼近函数：e^x ≈ 1 + x + x²/2 + x³/6 + ... ← 多项式
+        //  Padé 用分数逼近函数（两个多项式相除）：e^x ≈ P(x) / Q(x)  ← 有理函数
+        //  为什么 Padé 更好？ 因为exp(x) 在x → -∞ 时，e^x → 0（趋近零但永远不为零）
+        //  - Taylor级数中多项式只能趋近于 ±∞，无法趋近于0；
+        //  - P(x)/Q(x)是可以趋近于0的（只要分母增长比分子快就行）
+        // 4.2 什么是 Horner 法则？
+        //  Horner 法则是一种多项式求值的快速算法，可以减少乘法和加法的次数，提高计算效率
+        //  即把ax³ + bx² + cx + d 改写成嵌套形式((a*x + b)*x + c)*x + d
+        //  以下代码就是用 Horner 法则计算分子 P(x) 和分母 Q(x)，其中系数是预先算好的魔数常量（来自 Remco Bloemen 的论文）
+        // 4.3 系数的确定
+        //  一旦确定三个条件，p(x)和q(x)的系数就唯一确定了：
+        //  - 逼近目标：e^x
+        //  - 阶数：(6,7) = 最高次数6-1=5次多项式分子 +  最高次数7-1=6次多项式分母
+        //  - 展开点：x = 0
+        // 4.4 分子 p(x) 的计算
         int256 y = x + 1346386616545796478920950773328;
         y = ((y * x) >> 96) + 57155421227552351082224309758442;
         int256 p = y + x - 94201549194550492254356042504812;
         p = ((p * y) >> 96) + 28719021644029726153956944680412240;
+        // 这里有个技巧：最后一步计算后故意不 >> 96，p 留在 2^192 基数（2^96 × 2^96）
+        // 目的：最终要算 r = p / q。这样做省了一次移位操作
+        // 这就是为什么常数4385272521454847904659076985693276也要<< 96 —— 把它也提升到 2^192 基数与 p 对齐再做加法
         p = p * x + (4385272521454847904659076985693276 << 96);
 
-        // We leave p in 2**192 basis so we don't need to scale it back up for the division.
+        // 4.5 分母 q(x)的计算，标准Horner
+        // 每步的 * x >> 96 就是 2^96 定点下的乘法（乘完右移回2^96 基数）
+        // 6 步展开 = 6 次多项式。结果 q 在 2^96 基数
         int256 q = x - 2855989394907223263936484059900;
         q = ((q * x) >> 96) + 50020603652535783019961831881945;
         q = ((q * x) >> 96) - 533845033583426703283633433725380;
@@ -144,53 +308,130 @@ function wadExp(int256 x) pure returns (int256 r) {
 
         /// @solidity memory-safe-assembly
         assembly {
-            // Div in assembly because solidity adds a zero check despite the unchecked.
-            // The q polynomial won't have zeros in the domain as all its roots are complex.
-            // No scaling is necessary because p is already 2**96 too large.
+            // p(2^192基数) / q(2^96 基数) = r(2^96 基数)
+            // gas技巧：Solidity的 / 运算符即使在 unchecked {} 块中，编译器仍然会插入一个"除数是否为零"的检查，
+            // 由于 q(x) 是一个 6 次多项式，它的6 个根（令q = 0 的解）全部是复数，没有实数根
+            // 这是Padé逼近的数学性质保证的——论文作者在选系数时就确保了分母没有实数根
+            // 由于 x 取值在 int256 范围内（实数域的子集），而 q(x) 的根全是复数，所以可知q(x)在实数域上永远不会为0，这里特意使用Yul的sdiv来跳过除数不为0的检查
             r := sdiv(p, q)
+            // 注：r现在的范围是(0.09, 0.25) × 2^96
         }
 
-        // r should be in the range (0.09, 0.25) * 2**96.
-
-        // We now need to multiply r by:
-        // * the scale factor s = ~6.031367120.
-        // * the 2**k factor from the range reduction.
-        // * the 1e18 / 2**96 factor for base conversion.
-        // We do this all at once, with an intermediate result in 2**213
-        // basis, so the final right shift is always by a positive amount.
+        // 5. 最终组装：一步完成三个操作
+        //   - 乘以缩放因子 s ≈ 6.031367120（p/q 是首一多项式，差一个常数因子）
+        //   - 乘以 2^k（恢复范围缩减中分离的指数部分）
+        //   - 基数转换 10^18 / 2^96（从二进制定点转回wad）
+        // 5.1 现在的r是什么？
+        //  目前的r = P(x') / Q(x')，是 exp(x') 的近似值
+        //  由于 P和 Q 都是首一多项式（最高次系数 = 1），P/Q 的结果差一个常数缩放因子 s ≈ 6.031367120
+        //  真正的 exp(x') = r × s
+        // 5.2 如何将exp(x')还原成exp(x)？
+        //  几个遗留问题：
+        //  1. 目前r 在 2^96 基数下，但最终结果是 wad（10^18 基数）
+        //  2. 范围缩减时拆出了2^k，还没乘回来：exp(x) = exp(x') × 2^k = r × s × 2^k
+        //  数学推导：
+        //   result = r × s × 2^k × 10^18 / 2^96
+        //          = r × (s × 10^18 × 2^99) × 2^k / 2^(96+99)
+        //          = r × (s × 10^18 × 2^99)  / 2^(195-k)
+        //          = r × CONST >> (195 - k)
+        //  CONST = round(s × 10^18 × 2^99) = 3822833074963236453042738258902158003155416615667
+        // 5.3 为什么要凑出 2^195？
+        //  因为k的范围是[-61, 195]，将右移量凑成195-k后，可以保证195-k的范围是[0, 256]，右移量始终安全
         r = int256((uint256(r) * 3822833074963236453042738258902158003155416615667) >> uint256(195 - k));
     }
 }
 
+/*
+ * @dev wad 定点自然对数 ln(x)
+ *      算法来自 Remco Bloemen（https://xn--2-umb.com/22/exp-ln/）
+ *      流程：
+ *        1. 域检查：x > 0（ln对非正数无定义）
+ *        2. 二分搜索找floor(log2(x))，即最高有效位位置
+ *        3. 范围缩减：将 x 归一化到 [1, 2) × 2^96
+ *        4. (8,8) 阶 Padé有理逼近
+ *        5. 最终组装：缩放 + 加ln(2^96/10^18) + 加 k×ln(2) + 基数转换
+ * @param x wad 格式的输入（代表实数 x/1e18，必须为正）
+ * @return r wad 格式的 ln(x/1e18)
+ */
 function wadLn(int256 x) pure returns (int256 r) {
     unchecked {
+        // 1. 域检查，要求输入x必须为正数
+        // 因为ln对非正数无定义
         require(x > 0, "UNDEFINED");
 
-        // We want to convert x from 10**18 fixed point to 2**96 fixed point.
-        // We do this by multiplying by 2**96 / 10**18. But since
-        // ln(x * C) = ln(x) + ln(C), we can simply do nothing here
-        // and add ln(2**96 / 10**18) at the end.
-
+        // 2. 二分搜索找 r = floor(log2(x))，目的是找到 x 的最高有效位（MSB）在第几位
+        // 思路：将 256 位 MSB 位置拆解为 8 个二进制位 (b7~b0)
+        // 每步将搜索范围减半：
+        //   b7: x > 2^128-1? → 确定 MSB 在上半还是下半 256 位
+        //   b6: x>>r > 2^64-1? → 继续二分
+        //   ...依此类推直到 b0
+        // 结果：r = 128×b7 + 64×b6 + ... + 1×b0 = floor(log2(x))
         /// @solidity memory-safe-assembly
         assembly {
+            // b7：判断 x > 2^128 - 1，得出MSB 在高 128 位 (128~255) 还是低 128 位 (0~127)
+            // 如果是：r = 128，否则：r = 0
             r := shl(7, lt(0xffffffffffffffffffffffffffffffff, x))
+            // b6：将已确定的位移掉后，判断 剩余部分 > 2^64 - 1
+            // 如果是：r += 64，否则：r不变
             r := or(r, shl(6, lt(0xffffffffffffffff, shr(r, x))))
+            // b5：将已确定的位移掉后，判断 剩余部分 > 2^32 - 1
+            // 如果是：r += 32，否则：r不变
             r := or(r, shl(5, lt(0xffffffff, shr(r, x))))
+            // b4：将已确定的位移掉后，判断 剩余部分 > 2^16 - 1
+            // 如果是：r += 16，否则：r不变
             r := or(r, shl(4, lt(0xffff, shr(r, x))))
+            // b3：将已确定的位移掉后，判断 剩余部分 > 2^8 - 1
+            // 如果是：r += 8，否则：r不变
             r := or(r, shl(3, lt(0xff, shr(r, x))))
+            // b2：将已确定的位移掉后，判断 剩余部分 > 2^4 - 1
+            // 如果是：r += 4，否则：r不变
             r := or(r, shl(2, lt(0xf, shr(r, x))))
+            // b1：将已确定的位移掉后，判断 剩余部分 > 2^2 - 1
+            // 如果是：r += 2，否则：r不变
             r := or(r, shl(1, lt(0x3, shr(r, x))))
+            // b0：将已确定的位移掉后，判断 剩余部分 > 2^1 - 1
+            // 如果是：r += 1，否则：r不变
             r := or(r, lt(0x1, shr(r, x)))
+            // 此时r = floor(log2(x))
         }
 
-        // Reduce range of x to (1, 2) * 2**96
-        // ln(2^k * x) = k * ln(2) + ln(x)
-        int256 k = r - 96;
-        x <<= uint256(159 - k);
-        x = int256(uint256(x) >> 159);
+        // 3. 范围缩减（归一化）
+        // 先提取 m，使得 x = 2^r × m，m ∈ [1, 2)，并将m表示为 2^96 定点数
+        // 3.1 为什么要归一化：
+        //   Padé 逼近只在小范围内精确，需要将 x 归一化到固定区间 [2^96, 2^97)
+        //   数学依据：ln(x) = ln(2^r × m) = r × ln(2) + ln(m)
+        //   归一化后 Padé 只负责算 ln(m)，r × ln(2) 在后面补回
+        // 3.2 m为什么用2^96定点数表示？
+        //  同wadExp()中x用2^96定点数表示的原因
+        //  将m表示为2^96定点数后，会导致：
+        //      归一化前：x = 2^r × m
+        //      归一化后：x_new = 2^96 × m
+        //      x_new = x × 2^(96-r) = x × 2^(-k)
+        // 3.3 r × ln(2) 怎么补回？
+        //   归一化把 x 从 2^r × m 变成 2^96 × m，等于把 x 乘了 2^(96-r)
+        //   对应 ln 多了 (96-r) × ln(2)，需要减掉才能还原
+        //   令 k = r - 96，则 96 - r = -k，需要减掉的量为 -k × ln(2)
+        //   等价于第5步加回 k × ln(2)
+        //   少补的 96 × ln(2) 和延迟基数转换的 -ln(10^18)，合并到第 5 步的常数 ln(2^96/10^18) 中补偿
 
-        // Evaluate using a (8, 8)-term rational approximation.
-        // p is made monic, we will multiply by a scale factor later.
+        // 对x做归一化，即把 x 从 2^r × m 变成 2^96 × m，即把 MSB 从第 r 位挪到第 96 位
+        // 这部分对操作是先左移到顶再右移，而不是直接 x >> (r-96)。原因是：r可能 < 96，EVM没法右移一个负数位
+        // k为归一化偏移量
+        int256 k = r - 96;
+        // 将 x 的 MSB（第 r 位）左移到第 255 位
+        // 左移位数为255-r = 255-(k+96) = 159-k
+        // 目的：把有效位对齐到最高位，为下一步统一右移做准备
+        x <<= uint256(159 - k);
+        // 再从第 255 位统一移到第 96 位（255 - 159 = 96）
+        // 使用 uint256 cast 确保逻辑右移（填充 0），避免算术右移（填充符号位）
+        x = int256(uint256(x) >> 159);
+        // 此时，x 被归一化到 [2^96, 2^97) 范围内，即 2^96 定点数下的 [1, 2)
+
+        // 4. (8,8) 阶 Padé 有理逼近
+        // 比 exp 的(6,7) 阶高，因为 ln在[1,2) 上导数变化快（ln'(x)=1/x）
+        // 4.1 分子 p(x)：7 次多项式
+        //  这里有个技巧：最后一步计算后故意不 >> 96，p 留在 2^192 基数（2^96 × 2^96）
+        //  目的：最终要算 r = p / q。这样做省了一次移位操作
         int256 p = x + 3273285459638523848632254066296;
         p = ((p * x) >> 96) + 24828157081833163892658089445524;
         p = ((p * x) >> 96) + 43456485725739037958740375743393;
@@ -199,8 +440,7 @@ function wadLn(int256 x) pure returns (int256 r) {
         p = ((p * x) >> 96) - 14706773417378608786704636184526;
         p = p * x - (795164235651350426258249787498 << 96);
 
-        // We leave p in 2**192 basis so we don't need to scale it back up for the division.
-        // q is monic by convention.
+        // 4.2 分母 q(x)：7 次多项式，结果 q 在 2^96 基数
         int256 q = x + 5573035233440673466300451813936;
         q = ((q * x) >> 96) + 71694874799317883764090561454958;
         q = ((q * x) >> 96) + 283447036172924575727196451306956;
@@ -210,36 +450,63 @@ function wadLn(int256 x) pure returns (int256 r) {
         q = ((q * x) >> 96) + 909429971244387300277376558375;
         /// @solidity memory-safe-assembly
         assembly {
-            // Div in assembly because solidity adds a zero check despite the unchecked.
-            // The q polynomial is known not to have zeros in the domain.
-            // No scaling required because p is already 2**96 too large.
+            // 同 wadExp 中的 gas 技巧：q(x) 的根全是复数，实数域上不为零，
+            // 使用 Yul 的 sdiv 跳过 Solidity 编译器自动插入的除零检查
             r := sdiv(p, q)
+            // 注：r现在的范围是(0, 0.125) × 2^96
         }
 
-        // r is in the range (0, 0.125) * 2**96
+        // 5. 最终组装
+        // 5.1 现在的r是什么？
+        //  前面计算的 p(x) 和 q(x) 都是首一多项式，结果差一个缩放因子 s ≈ 5.549
+        //  真正的 ln(m) = r × s
+        // 5.2 几个遗留问题
+        //  - 归一化时ln多了 (96-r) × ln(2)，等价于需要加回 k × ln(2)
+        //  - 输入的x是 wad（10^18 定点），代码全程把 x 当裸整数算 ln(x)，实际要的是 ln(x/10^18)，多了ln(10^18)
+        //  - r 现在在 2^96 基数下，最终结果要转回 wad（10^18 基数）
+        // 5.3 数学上要做的事情
+        //  在 5^18 × 2^192 基数下统一计算，避免中间精度损失：
+        //      result_wad = (r × s + k × ln(2) + ln(2^96/ 10^18)) × 10^18
+        //  其中：
+        //  - r × s：补偿缩放因子，得到真正的ln(m)
+        //  - + k × ln(2)：前面归一化等于把 x 乘了 2^(96-r) = 2^(-k)，对应到ln就是多加了ln(2^(-k)) = -k × ln(2)，这里补偿回来
+        //  - + ln(2^96 / 10^18)：
+        //      1. ln(2^96)：Padé 算出 ln(m)，本应加 floor(log2(x)) × ln(2) 补回。但该值存在变量 r 中，
+        //         已被 p/q 覆盖，只能用 k × ln(2) = (floor(log2(x)) - 96) × ln(2) 补，
+        //         少补了 96 × ln(2)，在这里补上
+        //      2. -ln(10^18)：输入的x是10^18定点，目的是要算 ln(x/10^18)，但代码算的是 ln(x)。多了 ln(10^18)，需要减掉
+        // 5.4 为什么选 5^18 × 2^192 作为中间基数
+        //  10^18 = 5^18 × 2^18
+        //  如果在 5^18 × 2^192 基数下算完，最后只需：>> 192 - 18 = 174位
+        //  就能转回 10^18 = 5^18 × 2^18 基数（即 wad）
 
-        // Finalization, we need to:
-        // * multiply by the scale factor s = 5.549…
-        // * add ln(2**96 / 10**18)
-        // * add k * ln(2)
-        // * multiply by 10**18 / 2**96 = 5**18 >> 78
-
-        // mul s * 5e18 * 2**96, base is now 5**18 * 2**192
+        // 补偿缩放因子s，并将基数提高到5^18 × 2^192
+        // 常数1677202110996718588342820967067443963516166为 s × 5^18 × 2^96
+        // 因为r是2^96基数，乘完变为5^18 × 2^(96+96)基数
         r *= 1677202110996718588342820967067443963516166;
-        // add ln(2) * k * 5e18 * 2**192
+        // 补偿归一化导致多加的-k × ln(2)，基数提高到5^18 × 2^192
+        // 常数16597577552685614221487285958193947469193820559219878177908093499208371为 ln(2) × 5^18 × 2^192
         r += 16597577552685614221487285958193947469193820559219878177908093499208371 * k;
-        // add ln(2**96 / 10**18) * 5e18 * 2**192
+        // 补偿归一化剩余部分和延迟基数转换
+        // 常数600920179829731861736702779321621459595472258049074101567377883020018308为 ln(2^96 / 10^18) × 5^18 × 2^192
         r += 600920179829731861736702779321621459595472258049074101567377883020018308;
-        // base conversion: mul 2**18 / 2**192
+        // r 现在在 5^18 × 2^192 基数，将其转回，即wad（即基数10^18）
+        // 5^18 × 2^192 / 2^174 = 5^18 × 2^18 = 10^18
         r >>= 174;
     }
 }
 
-/// @dev Will return 0 instead of reverting if y is zero.
+/*
+ * @dev 有符号整数除法（不检查除零）
+ *      y 为 0 时返回 0（sdiv 除零行为），不会 revert
+ * @param x 被除数
+ * @param y 除数
+ * @return r 商
+ */
 function unsafeDiv(int256 x, int256 y) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        // Divide x by y.
+        // 有符号除法
         r := sdiv(x, y)
     }
 }
