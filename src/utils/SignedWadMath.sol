@@ -65,7 +65,7 @@ function toDaysWadUnsafe(uint256 x) pure returns (int256 r) {
  *      公式：r = x × 86400 / 1e18
  *      不做溢出检查，不处理负数（假设 x 为正）
  *      典型调用链：
- *          秒数──toDaysWadUnsafe──→ wad天数 ──wadExp/wadMul等运算──→ wad结果 ──fromDaysWadUnsafe──→ 秒数
+ *          秒数 -> toDaysWadUnsafe -> wad天数 -> wadExp/wadMul等运算 -> wad结果 -> fromDaysWadUnsafe -> 秒数
  * @param x wad 格式的天数（int256）
  * @return r 秒数（uint256）
  */
@@ -125,7 +125,7 @@ function unsafeWadDiv(int256 x, int256 y) pure returns (int256 r) {
 function wadMul(int256 x, int256 y) pure returns (int256 r) {
     /// @solidity memory-safe-assembly
     assembly {
-        //先计算 x * y 存入 r
+        // 先计算 x * y 存入 r
         r := mul(x, y)
 
         // 组合溢出检查（合并为1 个表达式，只产生 1 个 JUMPI）：
@@ -142,7 +142,7 @@ function wadMul(int256 x, int256 y) pure returns (int256 r) {
                 //        1.条件 B 针对二补码陷阱：x = -1, y = type(int256).min时
                 //          (-1) × (-2^255) 在二补码中回绕为 -2^255：(-1) × (-2^255) = 2^255 > int256.max（即2^255 - 1），产生溢出，
                 //          溢出后 EVM 的 mul 直接截断到 256 位，即1000...000（1后面 255 个 0）。这个位模式恰好就是 type(int256).min = -2^255
-                //          然后， (-2^255)/(-1) = -2^255 = y。（原因同上，2^255 由于溢出而被截断成为-2^255）
+                //          然后， (-2^255)/(-1) = -2^255 = y。（这不是补码层面的计算逻辑，而是 EVM 规范的硬编码特例。Yellow Paper中有定义：https://ethereum.github.io/yellowpaper/paper.pdf）
                 //          导致条件 A 误判为"未溢出"，需要条件 B 额外捕获
                 //        2.为什么不写 x != -1 或 y! = type(int256).min ?
                 //          Yul 没有 neq 操作码，用 lt/sgt 替代 iszero(eq(...))，省 2 个操作码
@@ -286,7 +286,7 @@ function wadExp(int256 x) pure returns (int256 r) {
         //  - 逼近目标：e^x
         //  - 阶数：(6,7) = 最高次数6-1=5次多项式分子 +  最高次数7-1=6次多项式分母
         //  - 展开点：x = 0
-        // 4.4 分子 p(x) 的计算
+        // 4.4 分子 p(x) 的计算（非标准 Horner，借用中间变量 y 做交叉展开）
         int256 y = x + 1346386616545796478920950773328;
         y = ((y * x) >> 96) + 57155421227552351082224309758442;
         int256 p = y + x - 94201549194550492254356042504812;
@@ -415,11 +415,11 @@ function wadLn(int256 x) pure returns (int256 r) {
         //   少补的 96 × ln(2) 和延迟基数转换的 -ln(10^18)，合并到第 5 步的常数 ln(2^96/10^18) 中补偿
 
         // 对x做归一化，即把 x 从 2^r × m 变成 2^96 × m，即把 MSB 从第 r 位挪到第 96 位
-        // 这部分对操作是先左移到顶再右移，而不是直接 x >> (r-96)。原因是：r可能 < 96，EVM没法右移一个负数位
+        // 这部分的操作是先左移到顶再右移，而不是直接 x >> (r-96)。原因是：r可能 < 96，EVM没法右移一个负数位
         // k为归一化偏移量
         int256 k = r - 96;
         // 将 x 的 MSB（第 r 位）左移到第 255 位
-        // 左移位数为255-r = 255-(k+96) = 159-k
+        // 左移位数为 255-r = 255-(k+96) = 159-k
         // 目的：把有效位对齐到最高位，为下一步统一右移做准备
         x <<= uint256(159 - k);
         // 再从第 255 位统一移到第 96 位（255 - 159 = 96）
@@ -428,7 +428,7 @@ function wadLn(int256 x) pure returns (int256 r) {
         // 此时，x 被归一化到 [2^96, 2^97) 范围内，即 2^96 定点数下的 [1, 2)
 
         // 4. (8,8) 阶 Padé 有理逼近
-        // 比 exp 的(6,7) 阶高，因为 ln在[1,2) 上导数变化快（ln'(x)=1/x）
+        // 比 exp 的(6,7) 阶高，因为 ln 在 [1,2) 上的曲率比 exp 在 (-½ln2, ½ln2) 上更大，需要更高阶才能达到同等精度
         // 4.1 分子 p(x)：7 次多项式
         //  这里有个技巧：最后一步计算后故意不 >> 96，p 留在 2^192 基数（2^96 × 2^96）
         //  目的：最终要算 r = p / q。这样做省了一次移位操作
